@@ -1,0 +1,319 @@
+{
+  "name": "Google Calendar -> Email -> Summary",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 7
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -80,
+        16
+      ],
+      "id": "678dfda6-03ed-43f9-ad71-fddd15a55a98",
+      "name": "Schedule Trigger",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "calendar": {
+          "__rl": true,
+          "value": "jamesrodri925@gmail.com",
+          "mode": "list",
+          "cachedResultName": "jamesrodri925@gmail.com"
+        },
+        "returnAll": true,
+        "timeMax": "={{ $now.plus({ hour: 12 }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        176,
+        0
+      ],
+      "id": "6f50fb34-f951-4198-942d-cb3467d693b0",
+      "name": "Get many events",
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "xqDdfAfLDk7qtmJX",
+          "name": "Google Calendar account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": true,
+        "simple": false,
+        "filters": {
+          "q": "={{ $json.gmailSearchQuery }}"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        560,
+        96
+      ],
+      "id": "7f104d66-a96b-4eb4-8362-41f41cf9bbd8",
+      "name": "Get many messages",
+      "webhookId": "3303b403-9f7b-4069-a7fe-f7c2e7e56520",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "OOP1m09i4jaQnWvc",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        976,
+        -16
+      ],
+      "id": "069d9c36-8e47-4ae5-a1fd-96913e41b6a9",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Function node\n * Input: items[] where each item.json is a Google Calendar event (like your example)\n * Output: ONE item:\n *   {\n *     count: <number of meetings>,\n *     meetings: [ { ...normalized meeting fields... } ],\n *     meetingsById: { \"<eventId>\": { ...same fields... }, ... }\n *   }\n *\n * Notes:\n * - Detects your account email from attendee.self OR organizer/creator.\n * - Classifies meeting type: \"online\" / \"in_person\" / \"hybrid\" / \"unspecified\".\n * - Picks a primary join link (Meet/Zoom/etc) and keeps all entry points.\n * - Normalizes attendees and includes quick counts.\n */\n\nfunction uniq(arr) {\n  return [...new Set((arr || []).filter(Boolean))];\n}\nfunction toLC(s){ return (s || '').toLowerCase().trim(); }\nfunction isUrl(s){ return /^https?:\\/\\//i.test(s || ''); }\nfunction minutesBetween(isoStart, isoEnd){\n  if(!isoStart || !isoEnd) return null;\n  const a = new Date(isoStart).getTime();\n  const b = new Date(isoEnd).getTime();\n  if (Number.isNaN(a) || Number.isNaN(b)) return null;\n  return Math.round((b - a)/60000);\n}\nfunction safeEntryPoints(conf){\n  const eps = Array.isArray(conf?.entryPoints) ? conf.entryPoints : [];\n  return eps.map(ep => ({\n    type: ep?.entryPointType || null,\n    uri: ep?.uri || null,\n    label: ep?.label || null,\n    pin: ep?.pin || null,\n    accessCode: ep?.accessCode || null,\n    meetingCode: ep?.meetingCode || null\n  }));\n}\nfunction pickPrimaryLink({hangoutLink, entryPoints}){\n  if (isUrl(hangoutLink)) return hangoutLink;\n  const firstUri = (entryPoints || []).find(ep => isUrl(ep.uri))?.uri;\n  return firstUri || null;\n}\nfunction classifyLocation(rawLocation, hasOnlineLink){\n  const hasPhysical = !!(rawLocation && !isUrl(rawLocation));\n  if (hasOnlineLink && hasPhysical) return { type: 'hybrid', addressOrLabel: rawLocation || null };\n  if (hasOnlineLink) return { type: 'online', addressOrLabel: null };\n  if (hasPhysical) return { type: 'in_person', addressOrLabel: rawLocation || null };\n  return { type: 'unspecified', addressOrLabel: rawLocation || null };\n}\nfunction normalizeAttendees(list){\n  const arr = Array.isArray(list) ? list : [];\n  const norm = arr.map(a => ({\n    email: toLC(a?.email || ''),\n    displayName: a?.displayName || null,\n    responseStatus: a?.responseStatus || null,\n    organizer: !!a?.organizer,\n    optional: !!a?.optional,\n    resource: !!a?.resource,\n    self: !!a?.self\n  }));\n  // Ensure unique by email (keep first with metadata)\n  const byEmail = {};\n  for (const a of norm){\n    const key = a.email || JSON.stringify(a);\n    if (!byEmail[key]) byEmail[key] = a;\n  }\n  return Object.values(byEmail);\n}\nfunction detectMyEmail(e){\n  // Prefer attendee.self; fallback to organizer/creator\n  const selfAtt = (Array.isArray(e.attendees) ? e.attendees : []).find(a => a?.self && a?.email);\n  return toLC(selfAtt?.email || e.organizer?.email || e.creator?.email || '');\n}\n\nconst meetings = items.map(it => {\n  const e = it.json || {};\n\n  const eventId = e.id || e.iCalUID || null;\n  const title = e.summary || e.description || '(no title)';\n  const myEmail = detectMyEmail(e);\n  const organizerEmail = toLC(e.organizer?.email || e.creator?.email || '');\n  const attendees = normalizeAttendees(e.attendees);\n  const attendeeEmails = uniq(attendees.map(a => a.email).filter(Boolean));\n\n  const start = e.start?.dateTime || e.start?.date || null;\n  const end   = e.end?.dateTime   || e.end?.date   || null;\n  const timezone = e.start?.timeZone || e.end?.timeZone || null;\n  const durationMinutes = minutesBetween(start, end);\n\n  const entryPoints = safeEntryPoints(e.conferenceData);\n  const joinLink = pickPrimaryLink({ hangoutLink: e.hangoutLink, entryPoints });\n  const locationRaw = e.location || e.hangoutLink || null;\n  const locationInfo = classifyLocation(e.location, !!joinLink);\n\n  const created = e.created || null;\n  const updated = e.updated || null;\n\n  // Handy counts/flags\n  const guestCount = attendeeEmails.length;\n  const isOrganizerSelf = organizerEmail && myEmail && organizerEmail === myEmail;\n\n  // Compose one compact record\n  const m = {\n    id: eventId,\n    iCalUID: e.iCalUID || null,\n    title,\n    start,\n    end,\n    timezone,\n    durationMinutes,\n\n    organizerEmail,\n    isOrganizerSelf,\n    myEmail,\n\n    attendees,          // normalized attendee objects\n    attendeeEmails,     // quick list of emails\n    guestCount,\n\n    location: {\n      type: locationInfo.type,      // 'online' | 'in_person' | 'hybrid' | 'unspecified'\n      addressOrLabel: locationInfo.addressOrLabel\n    },\n\n    links: {\n      join: joinLink,               // primary link to join\n      hangoutLink: e.hangoutLink || null,\n      entryPoints,                  // all available entry points\n      htmlLink: e.htmlLink || null  // calendar web link\n    },\n\n    conference: {\n      id: e.conferenceData?.conferenceId || null,\n      solutionName: e.conferenceData?.conferenceSolution?.name || null,\n      solutionType: e.conferenceData?.conferenceSolution?.key?.type || null\n    },\n\n    created,\n    updated,\n    status: e.status || null,\n    etag: e.etag || null,\n    kind: e.kind || null,\n    eventType: e.eventType || null\n  };\n\n  return m;\n});\n\nconst meetingsById = meetings.reduce((acc, m) => {\n  if (m.id) acc[m.id] = m;\n  return acc;\n}, {});\n\nreturn [\n  {\n    json: {\n      count: meetings.length,\n      meetings,\n      meetingsById\n    }\n  }\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        544,
+        -112
+      ],
+      "id": "d52f7e7a-bdc6-48f4-8c98-93f634d3accd",
+      "name": "meetings overall"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Function node\n * Input: items[] from Gmail (Get Many / Get Message with Simplify OFF recommended)\n * Output: single item with\n *   {\n *     count: <number>,\n *     emails: [ { id, threadId, date, subject, sender, recipients, body, snippet } ],\n *     emailsById: { \"<id>\": { ...same fields... }, ... }\n *   }\n *\n * Notes:\n * - Prefers plain text body; falls back to textAsHtml (stripped) or html (stripped).\n * - Recipients = to + cc + bcc (if present), deduped.\n */\n\nfunction stripHeaderPrefix(v) {\n  // turns \"Subject: Foo\" -> \"Foo\", \"From: Name <a@b>\" -> \"Name <a@b>\"\n  if (typeof v !== 'string') return v;\n  const idx = v.indexOf(':');\n  return idx > -1 ? v.slice(idx + 1).trim() : v.trim();\n}\nfunction toLowerTrim(s) {\n  return (s || '').toLowerCase().trim();\n}\nfunction uniq(arr) {\n  return [...new Set((arr || []).filter(Boolean))];\n}\nfunction ensureArray(x) {\n  return Array.isArray(x) ? x : (x ? [x] : []);\n}\nfunction extractAddresses(field) {\n  // field can be { value: [{address, name}, ...], text, html } or string\n  if (!field) return [];\n  if (Array.isArray(field.value)) {\n    return uniq(field.value.map(v => toLowerTrim(v.address || v.text || v.name || '')));\n  }\n  if (typeof field.text === 'string') {\n    return field.text.split(',').map(s => toLowerTrim(s.replace(/^.*<|>.*$/g,'')));\n  }\n  if (typeof field === 'string') {\n    // e.g., \"To: a@b, c@d\"\n    const t = stripHeaderPrefix(field);\n    return t.split(',').map(s => toLowerTrim(s.replace(/^.*<|>.*$/g,'')));\n  }\n  return [];\n}\nfunction pickBody(m) {\n  // Prefer plain text -> textAsHtml stripped -> html stripped -> \"\"\n  if (m.text && typeof m.text === 'string') return m.text;\n  const fromHtml = (m.textAsHtml || m.html || '').toString();\n  if (!fromHtml) return '';\n  return fromHtml\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, '')\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, '')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\nfunction parseSubject(m) {\n  return m.subject ||\n         stripHeaderPrefix(m.headers?.subject) ||\n         stripHeaderPrefix(m.headers?.Subject) ||\n         '';\n}\nfunction parseFrom(m) {\n  // Try parsed 'from', then headers\n  const parsed = extractAddresses(m.from);\n  if (parsed.length) return parsed[0];\n  const hdr = m.headers?.from || m.headers?.From || '';\n  const s = stripHeaderPrefix(hdr);\n  // pull first addr in \"Name <a@b>\" or \"a@b\"\n  const match = s.match(/<([^>]+)>/);\n  return toLowerTrim(match ? match[1] : s.split(',')[0]);\n}\nfunction parseRecipients(m) {\n  const to = extractAddresses(m.to).concat(extractAddresses(m.headers?.to || m.headers?.To));\n  const cc = extractAddresses(m.cc).concat(extractAddresses(m.headers?.cc || m.headers?.Cc));\n  const bcc = extractAddresses(m.bcc).concat(extractAddresses(m.headers?.bcc || m.headers?.Bcc));\n  return uniq([...to, ...cc, ...bcc]);\n}\n\nconst emails = items.map(it => {\n  const m = it.json || {};\n  return {\n    id: m.id || null,\n    threadId: m.threadId || null,\n    date: m.date || m.headers?.date ? stripHeaderPrefix(m.headers?.date || m.headers?.Date || '') : null,\n    subject: parseSubject(m),\n    sender: parseFrom(m),\n    recipients: parseRecipients(m),\n    body: pickBody(m),\n    snippet: m.snippet || null,\n  };\n});\n\nconst emailsById = emails.reduce((acc, e) => { if (e.id) acc[e.id] = e; return acc; }, {});\nreturn [\n  {\n    json: {\n      count: emails.length,\n      emails,       // easy to loop\n      emailsById    // quick lookup by id\n    }\n  }\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        768,
+        96
+      ],
+      "id": "a40417b9-13f4-4fda-a19e-83f061c0d76a",
+      "name": "emails overall"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Function node\n * Same logic as before (from:/to: chains excluding your email) + last 5 days.\n * Appends:  newer_than:5d\n */\n\nfunction uniq(arr) {\n  return [...new Set((arr || []).map(x => (x || '').toLowerCase().trim()).filter(Boolean))];\n}\n\nreturn items.map(it => {\n  const e = it.json || {};\n\n  // detect your own gmail (attendee.self -> organizer -> creator)\n  const myEmail =\n    e.attendees?.find(a => a.self)?.email?.toLowerCase().trim() ||\n    e.organizer?.email?.toLowerCase().trim() ||\n    e.creator?.email?.toLowerCase().trim() ||\n    null;\n\n  const eventTitle = e.summary || '(no title)';\n  const attendees = Array.isArray(e.attendees) ? uniq(e.attendees.map(a => a.email)) : [];\n  const others = attendees.filter(email => email && email !== myEmail);\n\n  let gmailSearchQuery = null;\n  if (others.length > 0) {\n    const fromClause = others.map(r => `from:${r}`).join(' OR ');\n    const toClause   = others.map(r => `to:${r}`).join(' OR ');\n    gmailSearchQuery = `${fromClause} OR ${toClause} newer_than:5d`.replace(/\\s+/g,' ').trim();\n  }\n\n  return {\n    json: {\n      eventTitle,\n      myEmail,\n      start: e.start?.dateTime || e.start?.date || null,\n      end: e.end?.dateTime || e.end?.date || null,\n      location: e.location || e.hangoutLink || (e.conferenceData?.entryPoints?.[0]?.uri || null),\n      attendees,\n      gmailSearchQuery\n    }\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        96
+      ],
+      "id": "654fc4ab-207d-47b7-a418-52011c623968",
+      "name": "get query"
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * n8n Function node\n * Goal: Merge multiple items (e.g., one with meetings, one with emails)\n *       into a SINGLE output item.\n *\n * Input (example):\n *   items[0] => { count, meetings: [...], meetingsById: {...} }\n *   items[1] => { count, emails: [...], emailsById: {...} }\n *\n * Output (single item):\n * {\n *   meetings: [...deduped by id...],\n *   meetingsById: { id: meeting, ... },\n *   meetingsCount: <number>,\n *\n *   emails: [...deduped by id...],\n *   emailsById: { id: email, ... },\n *   emailsCount: <number>,\n *\n *   sourceCounts: { meetingsBlocks: n, emailsBlocks: n }\n * }\n */\n\nfunction asArray(x) { return Array.isArray(x) ? x : []; }\nfunction isObj(o) { return o && typeof o === 'object' && !Array.isArray(o); }\n\nconst mergedMeetingsById = {};\nconst mergedEmailsById = {};\nlet meetingsBlocks = 0;\nlet emailsBlocks = 0;\n\n// 1) Collect & merge from all incoming items\nfor (const it of items) {\n  const j = it.json || {};\n\n  // Meetings\n  if (Array.isArray(j.meetings) || isObj(j.meetingsById)) {\n    meetingsBlocks += 1;\n\n    // Merge meetings array\n    for (const m of asArray(j.meetings)) {\n      const id = m?.id || m?.iCalUID || m?.iCalId || null;\n      if (!id) continue;\n      // Prefer the most complete version (later entries can overwrite earlier)\n      mergedMeetingsById[id] = { ...(mergedMeetingsById[id] || {}), ...m };\n    }\n\n    // Merge meetingsById map\n    if (isObj(j.meetingsById)) {\n      for (const [id, m] of Object.entries(j.meetingsById)) {\n        mergedMeetingsById[id] = { ...(mergedMeetingsById[id] || {}), ...(m || {}) };\n      }\n    }\n  }\n\n  // Emails\n  if (Array.isArray(j.emails) || isObj(j.emailsById)) {\n    emailsBlocks += 1;\n\n    // Merge emails array\n    for (const e of asArray(j.emails)) {\n      const id = e?.id || null;\n      if (!id) continue;\n      mergedEmailsById[id] = { ...(mergedEmailsById[id] || {}), ...e };\n    }\n\n    // Merge emailsById map\n    if (isObj(j.emailsById)) {\n      for (const [id, e] of Object.entries(j.emailsById)) {\n        mergedEmailsById[id] = { ...(mergedEmailsById[id] || {}), ...(e || {}) };\n      }\n    }\n  }\n}\n\n// 2) Produce deduped arrays from the merged maps\nconst meetings = Object.values(mergedMeetingsById);\nconst emails = Object.values(mergedEmailsById);\n\n// 3) Final single item\nreturn [{\n  json: {\n    meetings,\n    meetingsById: mergedMeetingsById,\n    meetingsCount: meetings.length,\n\n    emails,\n    emailsById: mergedEmailsById,\n    emailsCount: emails.length,\n\n    // Helpful debug metadata\n    sourceCounts: {\n      meetingsBlocks,\n      emailsBlocks,\n      inputItems: items.length\n    }\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1184,
+        -16
+      ],
+      "id": "8596dbd2-a120-44fa-b176-93ad78deeb03",
+      "name": "merge everything"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "GPT-4O-MINI"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=GOAL\n\nCreate a single structured JSON object that I can send to myself by email.\nThe output must contain:\n\nMy own email address\n\nOne subject line\n\nOne body containing separate paragraphs for each meeting happening today, ordered by meeting time.\nEach paragraph must clearly state whether I am the organizer or an attendee, include timing, location, attendee count, and summarize relevant points extracted from related emails.\n\nTASK\n\nFor each meeting, find related emails by:\n\nPeople overlap (organizer/attendees vs email from/to/cc/bcc)\n\nTime proximity (prefer ±72h around meeting start)\n\nTopic similarity (title keywords, Meet links, iCal IDs)\n\nBuild one paragraph per meeting:\n\nStart with my role (“You are the organizer” or “You are an attendee”)\n\nInclude title, time, location, and number of participants\n\nIf there are related emails → summarize key discussion points and any questions or reminders\n\nIf no related emails are found, simply note:\n“No related emails were found for this meeting.”\n\nOrder paragraphs by meeting start time ascending.\n\nKeep paragraphs short and readable — around 3–6 sentences each.\n\n\nINPUT\n\nmeetings_json:\n{{ JSON.stringify($json.meetings) }}\n\nemails_json:\n{{ JSON.stringify($json.emails) }}\n\n{\n  \"myself\": \"string\",                   // my email (detected from meeting.self or organizer)\n  \"subject\": \"string\",                  // e.g., \"Today's Meeting Summaries – Oct 20, 2025\"\n  \"body\": \"string\",                     // one paragraph per meeting, separated by blank lines\n  \"meetings_order\": [\"id1\", \"id2\"],     // meeting IDs in same order as body\n  \"meta\": {\n    \"meeting_count\": number,            // number of meetings processed\n    \"unmatched_emails\": [\"id3\", \"id4\"]  // emails not linked to any meeting\n  }\n}\n\n\nSTYLE & CONSTRAINTS\n\nDo not invent facts — only use details found in the provided data.\n\nPrefer the most recent email when conflicts occur.\n\nStrip signatures, quoted history, and boilerplate.\n\nUse plain text only (no markdown or bullets).\n\nKeep it clean, friendly, and natural — as if written by a human assistant summarizing upcoming meetings."
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [
+        1424,
+        -16
+      ],
+      "id": "7b226c9b-4dae-416d-987b-845cdb9041e3",
+      "name": "Message a model",
+      "credentials": {
+        "openAiApi": {
+          "id": "BgtHifs8ekWoIwdx",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.message.content.myself }}",
+        "subject": "={{ $json.message.content.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.message.content.body }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1776,
+        -16
+      ],
+      "id": "0c7a2722-c938-4dd0-bd9f-b35c77213c0d",
+      "name": "Send a message",
+      "webhookId": "394c781f-b555-4934-853f-c7698f9a30c1",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "OOP1m09i4jaQnWvc",
+          "name": "Gmail account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get many events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get many events": {
+      "main": [
+        [
+          {
+            "node": "get query",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "meetings overall",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get many messages": {
+      "main": [
+        [
+          {
+            "node": "emails overall",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "meetings overall": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "emails overall": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "get query": {
+      "main": [
+        [
+          {
+            "node": "Get many messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "merge everything",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "merge everything": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "f933db18-4dba-4218-84dd-a796888adf0c",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "d3af629a6fa44bbc7e27c8326f4d63e7e6f0a59b51e63f255621490e683a301c"
+  },
+  "id": "cHdcv4OFlJeM4iJC",
+  "tags": []
+}
